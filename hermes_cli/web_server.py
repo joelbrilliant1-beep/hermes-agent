@@ -833,6 +833,146 @@ async def get_system_stats():
 
 
 # ---------------------------------------------------------------------------
+# Curator endpoints — background skill-maintenance status + controls.
+#
+# The curator periodically reviews skills (archive stale, prune, pin).  The
+# dashboard surfaces its state and the pause/resume/run-now controls that
+# `hermes curator` exposes.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/curator")
+async def get_curator_status():
+    try:
+        from agent import curator
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Curator unavailable: {exc}")
+    try:
+        state = curator.load_state()
+    except Exception:
+        state = {}
+    return {
+        "enabled": _safe_call(curator, "is_enabled", True),
+        "paused": _safe_call(curator, "is_paused", False),
+        "interval_hours": _safe_call(curator, "get_interval_hours", None),
+        "last_run_at": state.get("last_run_at"),
+        "min_idle_hours": _safe_call(curator, "get_min_idle_hours", None),
+        "stale_after_days": _safe_call(curator, "get_stale_after_days", None),
+        "archive_after_days": _safe_call(curator, "get_archive_after_days", None),
+    }
+
+
+class CuratorPause(BaseModel):
+    paused: bool
+
+
+@app.put("/api/curator/paused")
+async def set_curator_paused(body: CuratorPause):
+    from agent import curator
+
+    curator.set_paused(bool(body.paused))
+    return {"ok": True, "paused": bool(body.paused)}
+
+
+@app.post("/api/curator/run")
+async def run_curator():
+    """Trigger a curator review now (backgrounded; tail via action status)."""
+    try:
+        proc = _spawn_hermes_action(["curator", "run"], "curator-run")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to run curator: {exc}")
+    return {"ok": True, "pid": proc.pid, "name": "curator-run"}
+
+
+def _safe_call(mod, fn_name: str, default):
+    try:
+        fn = getattr(mod, fn_name, None)
+        return fn() if callable(fn) else default
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Portal endpoint — Nous Portal auth + Tool Gateway routing status (read-only).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/portal")
+async def get_portal_status():
+    cfg = load_config() or {}
+    auth: Dict[str, Any] = {}
+    try:
+        from hermes_cli.auth import get_nous_auth_status
+
+        auth = get_nous_auth_status() or {}
+    except Exception:
+        auth = {}
+
+    features = []
+    try:
+        from hermes_cli.nous_subscription import get_nous_subscription_features
+
+        feats = get_nous_subscription_features(cfg)
+        if feats is not None:
+            for feat in feats.items():
+                if getattr(feat, "managed_by_nous", False):
+                    state = "via Nous Portal"
+                elif getattr(feat, "active", False) and getattr(feat, "current_provider", None):
+                    state = feat.current_provider
+                elif getattr(feat, "active", False):
+                    state = "active"
+                else:
+                    state = "not configured"
+                features.append({"label": getattr(feat, "label", ""), "state": state})
+    except Exception:
+        _log.exception("portal features failed")
+
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    return {
+        "logged_in": bool(auth.get("logged_in")),
+        "portal_url": auth.get("portal_base_url"),
+        "inference_url": auth.get("inference_base_url"),
+        "provider": str((model_cfg or {}).get("provider") or ""),
+        "subscription_url": "https://portal.nousresearch.com/manage-subscription",
+        "features": features,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: prompt-size, support dump, debug upload, config migrate.
+# All produce text output, so they spawn background actions tailed via
+# /api/actions/<name>/status.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/ops/prompt-size")
+async def run_prompt_size():
+    try:
+        proc = _spawn_hermes_action(["prompt-size"], "prompt-size")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed: {exc}")
+    return {"ok": True, "pid": proc.pid, "name": "prompt-size"}
+
+
+@app.post("/api/ops/dump")
+async def run_dump():
+    try:
+        proc = _spawn_hermes_action(["dump"], "dump")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed: {exc}")
+    return {"ok": True, "pid": proc.pid, "name": "dump"}
+
+
+@app.post("/api/ops/config-migrate")
+async def run_config_migrate():
+    try:
+        proc = _spawn_hermes_action(["config", "migrate"], "config-migrate")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed: {exc}")
+    return {"ok": True, "pid": proc.pid, "name": "config-migrate"}
+
+
+# ---------------------------------------------------------------------------
 # Gateway + update actions (invoked from the Status page).
 #
 # Both commands are spawned as detached subprocesses so the HTTP request
@@ -858,6 +998,10 @@ _ACTION_LOG_FILES: Dict[str, str] = {
     "skills-install": "action-skills-install.log",
     "skills-uninstall": "action-skills-uninstall.log",
     "skills-update": "action-skills-update.log",
+    "curator-run": "action-curator-run.log",
+    "prompt-size": "action-prompt-size.log",
+    "dump": "action-dump.log",
+    "config-migrate": "action-config-migrate.log",
 }
 
 # ``name`` → most recently spawned Popen handle.  Used so ``status`` can
