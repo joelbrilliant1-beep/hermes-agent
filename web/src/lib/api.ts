@@ -522,6 +522,32 @@ export const api = {
       `/api/mcp/servers/${encodeURIComponent(name)}/test`,
       { method: "POST" },
     ),
+  setMcpServerEnabled: (name: string, enabled: boolean) =>
+    fetchJSON<{ ok: boolean; name: string; enabled: boolean }>(
+      `/api/mcp/servers/${encodeURIComponent(name)}/enabled`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      },
+    ),
+  getMcpCatalog: () =>
+    fetchJSON<{ entries: McpCatalogEntry[]; diagnostics: McpCatalogDiagnostic[] }>(
+      "/api/mcp/catalog",
+    ),
+  installMcpCatalogEntry: (
+    name: string,
+    env: Record<string, string> = {},
+    enable = true,
+  ) =>
+    fetchJSON<{ ok: boolean; name: string; background: boolean; action?: string }>(
+      "/api/mcp/catalog/install",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, env, enable }),
+      },
+    ),
 
   // ── Admin: Pairing ──────────────────────────────────────────────────
   getPairing: () => fetchJSON<PairingResponse>("/api/pairing"),
@@ -554,6 +580,15 @@ export const api = {
     fetchJSON<{ ok: boolean }>(`/api/webhooks/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
+  setWebhookEnabled: (name: string, enabled: boolean) =>
+    fetchJSON<{ ok: boolean; name: string; enabled: boolean }>(
+      `/api/webhooks/${encodeURIComponent(name)}/enabled`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      },
+    ),
 
   // ── Admin: Credential pool ──────────────────────────────────────────
   getCredentialPool: () =>
@@ -616,6 +651,23 @@ export const api = {
       body: JSON.stringify({ archive }),
     }),
   getHooks: () => fetchJSON<HooksResponse>("/api/ops/hooks"),
+  createHook: (body: HookCreate) =>
+    fetchJSON<{ ok: boolean; event: string; command: string; approved: boolean }>(
+      "/api/ops/hooks",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  deleteHook: (event: string, command: string) =>
+    fetchJSON<{ ok: boolean }>("/api/ops/hooks", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event, command }),
+    }),
+  getSystemStats: () => fetchJSON<SystemStats>("/api/system/stats"),
+
   getCheckpoints: () => fetchJSON<CheckpointsResponse>("/api/ops/checkpoints"),
   pruneCheckpoints: () =>
     fetchJSON<ActionResponse>("/api/ops/checkpoints/prune", { method: "POST" }),
@@ -677,6 +729,25 @@ export interface McpServer {
   tools: string[] | null;
 }
 
+export interface McpCatalogEntry {
+  name: string;
+  description: string;
+  source: string;
+  transport: "http" | "stdio";
+  auth_type: "api_key" | "oauth" | "none";
+  required_env: Array<{ name: string; prompt: string; required: boolean }>;
+  needs_install: boolean;
+  installed: boolean;
+  enabled: boolean;
+}
+
+export interface McpCatalogDiagnostic {
+  name: string;
+  kind: string;
+  message: string;
+}
+
+
 export interface McpServerCreate {
   name: string;
   url?: string;
@@ -716,6 +787,7 @@ export interface WebhookRoute {
   created_at: string | null;
   url: string;
   secret_set: boolean;
+  enabled: boolean;
 }
 
 export interface WebhooksResponse {
@@ -771,11 +843,41 @@ export interface HookEntry {
   command: string | null;
   timeout: number | null;
   allowed: boolean;
+  approved_at?: string | null;
+  executable?: boolean;
 }
 
 export interface HooksResponse {
   hooks: HookEntry[];
-  allowlist: string[];
+  valid_events: string[];
+}
+
+export interface HookCreate {
+  event: string;
+  command: string;
+  matcher?: string;
+  timeout?: number;
+  approve?: boolean;
+}
+
+export interface SystemStats {
+  os: string;
+  os_release: string;
+  os_version: string;
+  platform: string;
+  arch: string;
+  hostname: string;
+  python_version: string;
+  python_impl: string;
+  hermes_version: string;
+  cpu_count: number | null;
+  psutil: boolean;
+  cpu_percent?: number;
+  load_avg?: number[];
+  uptime_seconds?: number;
+  memory?: { total: number; available: number; used: number; percent: number };
+  disk?: { total: number; used: number; free: number; percent: number };
+  process?: { pid: number; rss: number; create_time: number; num_threads: number };
 }
 
 export interface CheckpointSession {
