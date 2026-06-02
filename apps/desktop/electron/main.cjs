@@ -373,6 +373,21 @@ app.setAboutPanelOptions({
 // handler removes the size cap and gives the <video> element seekable,
 // range-aware playback. Must be registered before the app is ready.
 const MEDIA_PROTOCOL = 'hermes-media'
+// Only audio/video may be streamed. Without this the handler would read any
+// non-blocklisted local file (no size cap) for any `fetch(hermes-media://…)`.
+const STREAMABLE_MEDIA_EXTS = new Set([
+  '.avi',
+  '.flac',
+  '.m4a',
+  '.mkv',
+  '.mov',
+  '.mp3',
+  '.mp4',
+  '.ogg',
+  '.opus',
+  '.wav',
+  '.webm'
+])
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -395,6 +410,10 @@ function registerMediaProtocol() {
       ;({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
     } catch {
       return new Response('Media not found', { status: 404 })
+    }
+
+    if (!STREAMABLE_MEDIA_EXTS.has(path.extname(resolvedPath).toLowerCase())) {
+      return new Response('Unsupported media type', { status: 415 })
     }
 
     // Delegate to Electron's net stack on a file:// URL — it resolves the
