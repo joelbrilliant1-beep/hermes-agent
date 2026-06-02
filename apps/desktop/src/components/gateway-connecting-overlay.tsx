@@ -138,6 +138,11 @@ export function GatewayConnectingOverlay() {
     }
   }, [phase, previewing])
 
+  // Boot failed — BootFailureOverlay owns the screen; don't linger behind it.
+  if (boot.error && !previewing) {
+    return null
+  }
+
   // Real connect: once the fade finishes, get out of the way for good.
   if (phase === 'gone' && !previewing) {
     return null
