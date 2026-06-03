@@ -249,6 +249,112 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_public_completion_notification_does_not_dump_raw_output(monkeypatch, tmp_path):
+    """Chat-platform watcher notifications should stay short.
+
+    Full process output is available through the process log; dumping even the
+    last chunk into Discord/Telegram makes the human chat and Desktop session
+    viewer unusable.
+    """
+    import tools.process_registry as pr_module
+
+    raw_marker = "RAW_PROCESS_OUTPUT_SHOULD_NOT_BE_SENT_TO_CHAT"
+    sessions = [
+        SimpleNamespace(
+            output_buffer=("build noise\n" * 120) + raw_marker + "\n",
+            exited=True,
+            exit_code=1,
+        )
+    ]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "error")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict(session_id="proc_raw"))
+
+    adapter.send.assert_awaited_once()
+    sent_message = adapter.send.await_args.args[1]
+    assert raw_marker not in sent_message
+    assert "Here's the final output" not in sent_message
+    assert "process(action=\"log\", session_id=\"proc_raw\")" in sent_message
+    assert len(sent_message) < 500
+
+
+@pytest.mark.asyncio
+async def test_public_running_notification_does_not_dump_raw_output(monkeypatch, tmp_path):
+    """Running-output status pings should announce availability, not paste logs."""
+    import tools.process_registry as pr_module
+
+    raw_marker = "RAW_RUNNING_OUTPUT_SHOULD_NOT_BE_SENT_TO_CHAT"
+    sessions = [
+        SimpleNamespace(output_buffer=("stream noise\n" * 80) + raw_marker, exited=False, exit_code=None),
+        None,
+    ]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict(session_id="proc_stream"))
+
+    adapter.send.assert_awaited_once()
+    sent_message = adapter.send.await_args.args[1]
+    assert raw_marker not in sent_message
+    assert "New output:" not in sent_message
+    assert "process(action=\"log\", session_id=\"proc_stream\")" in sent_message
+    assert len(sent_message) < 500
+
+
+@pytest.mark.asyncio
+async def test_agent_completion_notification_points_to_log_instead_of_raw_output(monkeypatch, tmp_path):
+    """notify_on_complete should not persist raw stdout as a synthetic user turn."""
+    import tools.process_registry as pr_module
+
+    raw_marker = "RAW_AGENT_COMPLETION_OUTPUT_SHOULD_NOT_BE_IN_SESSION"
+    sessions = [SimpleNamespace(
+        output_buffer=("agent noise\n" * 160) + raw_marker + "\n",
+        exited=True,
+        exit_code=1,
+        command="python long_task.py",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    watcher = {
+        "session_id": "proc_agent_raw",
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123:24296",
+        "platform": "telegram",
+        "chat_id": "123",
+        "thread_id": "24296",
+        "notify_on_complete": True,
+    }
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert raw_marker not in synth_event.text
+    assert "Output:" not in synth_event.text
+    assert "process(action=\"log\", session_id=\"proc_agent_raw\")" in synth_event.text
+    assert len(synth_event.text) < 600
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

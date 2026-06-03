@@ -1627,7 +1627,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
-    _cmd = evt.get("command", "unknown")
+    _cmd = _short_process_command(evt.get("command", "unknown"))
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
@@ -1648,6 +1648,52 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         return text
 
     return None
+
+
+def _short_process_command(command: object, *, limit: int = 300) -> str:
+    """Return a single-line command snippet safe for chat-sized notices."""
+    text = str(command or "unknown").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)]}…"
+
+
+def _process_log_hint(session_id: object) -> str:
+    sid = str(session_id or "unknown")
+    return f'Full output is available via process(action="log", session_id="{sid}").'
+
+
+def _format_process_completion_notice(
+    *,
+    session_id: str,
+    command: object,
+    exit_code: object,
+    internal: bool,
+) -> str:
+    command_text = _short_process_command(command)
+    if internal:
+        return (
+            f"[IMPORTANT: Background process {session_id} completed "
+            f"(exit code {exit_code}).\n"
+            f"Command: {command_text}\n"
+            f"Output omitted from this synthetic message to keep the transcript readable.\n"
+            f"{_process_log_hint(session_id)}]"
+        )
+    return (
+        f"[Background process {session_id} finished with exit code {exit_code}.\n"
+        f"Command: {command_text}\n"
+        f"Output omitted to keep chat readable.\n"
+        f"{_process_log_hint(session_id)}]"
+    )
+
+
+def _format_process_running_notice(*, session_id: str, command: object) -> str:
+    return (
+        f"[Background process {session_id} is still running.\n"
+        f"Command: {_short_process_command(command)}\n"
+        f"New output is available in the process log.\n"
+        f"{_process_log_hint(session_id)}]"
+    )
 
 
 # Module-level weak reference to the active GatewayRunner instance.
@@ -15824,25 +15870,11 @@ class GatewayRunner:
                 # Skip if the agent already consumed the result via wait/poll/log
                 from tools.process_registry import process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    from tools.ansi_strip import strip_ansi
-                    _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
-                    # Truncate at line boundaries so notifications never start
-                    # mid-line (fixes #23284). Keep the last ~2000 chars but
-                    # snap to the nearest preceding newline, then prepend a
-                    # truncation marker when output was cut.
-                    _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
-                        _tail = _raw[-_LIMIT:]
-                        _nl = _tail.find("\n")
-                        _tail = _tail[_nl + 1:] if _nl != -1 else _tail
-                        _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
-                    else:
-                        _out = _raw
-                    synth_text = (
-                        f"[IMPORTANT: Background process {session_id} completed "
-                        f"(exit code {session.exit_code}).\n"
-                        f"Command: {session.command}\n"
-                        f"Output:\n{_out}]"
+                    synth_text = _format_process_completion_notice(
+                        session_id=session_id,
+                        command=getattr(session, "command", "unknown"),
+                        exit_code=session.exit_code,
+                        internal=True,
                     )
                     source = self._build_process_event_source({
                         "session_id": session_id,
@@ -15893,10 +15925,11 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
-                    message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                    message_text = _format_process_completion_notice(
+                        session_id=session_id,
+                        command=getattr(session, "command", "unknown"),
+                        exit_code=session.exit_code,
+                        internal=False,
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -15914,10 +15947,9 @@ class GatewayRunner:
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output available -- deliver status update (only in "all" mode)
                 # Skip periodic updates for agent_notify watchers (they only care about completion)
-                new_output = session.output_buffer[-500:] if session.output_buffer else ""
-                message_text = (
-                    f"[Background process {session_id} is still running~ "
-                    f"New output:\n{new_output}]"
+                message_text = _format_process_running_notice(
+                    session_id=session_id,
+                    command=getattr(session, "command", "unknown"),
                 )
                 adapter = None
                 for p, a in self.adapters.items():

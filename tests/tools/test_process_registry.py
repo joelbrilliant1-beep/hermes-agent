@@ -939,19 +939,24 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
-def test_format_completion_event():
+def test_format_completion_event_points_to_process_log_without_raw_output():
+    raw_marker = "RAW_PROCESS_OUTPUT_SHOULD_NOT_BE_IN_SYNTHETIC_MESSAGE"
     evt = {
         "type": "completion",
         "session_id": "proc_abc",
         "command": "sleep 5",
         "exit_code": 0,
-        "output": "done",
+        "output": "done\n" + raw_marker,
     }
     result = format_process_notification(evt)
+    assert result is not None
     assert "[IMPORTANT: Background process proc_abc completed" in result
     assert "exit code 0" in result
     assert "Command: sleep 5" in result
-    assert "Output:\ndone]" in result
+    assert raw_marker not in result
+    assert "Output:" not in result
+    assert "process(action=\"log\", session_id=\"proc_abc\")" in result
+    assert len(result) < 500
 
 
 def test_format_watch_match_event():

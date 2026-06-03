@@ -343,10 +343,12 @@ display:
 
 | Mode | What you receive |
 |------|-----------------|
-| `all` | Running-output updates **and** the final completion message (default) |
+| `all` | Running-output availability notices **and** the final completion message (default) |
 | `result` | Only the final completion message (regardless of exit code) |
 | `error` | Only the final message when the exit code is non-zero |
 | `off` | No process watcher messages at all |
+
+Process watcher messages intentionally do not paste raw stdout/stderr into chat. They include the process id, exit code, command snippet, and a `process(action="log", session_id="...")` hint so the agent can fetch the full log when needed without flooding Discord, Telegram, or Desktop sessions.
 
 You can also set this via environment variable:
 

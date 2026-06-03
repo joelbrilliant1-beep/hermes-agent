@@ -1490,15 +1490,32 @@ class ProcessRegistry:
 process_registry = ProcessRegistry()
 
 
+def _short_process_command(command: object, *, limit: int = 300) -> str:
+    """Return a single-line command snippet safe for chat-sized notices."""
+    text = str(command or "unknown").replace("\r", " ").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)]}…"
+
+
+def _process_log_hint(session_id: object) -> str:
+    sid = str(session_id or "unknown")
+    return f'Full output is available via process(action="log", session_id="{sid}").'
+
+
 def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
     Handles completion events (notify_on_complete), watch pattern matches,
-    and watch disabled events from the unified completion_queue.
+    and watch disabled events from the unified completion_queue. Completion
+    messages intentionally do not include raw stdout/stderr: these synthetic
+    messages are persisted as conversation turns and rendered by gateway/desktop
+    clients, so pasting process logs here makes sessions unreadable. The process
+    tool remains the source of truth for full output.
     """
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
-    _cmd = evt.get("command", "unknown")
+    _cmd = _short_process_command(evt.get("command", "unknown"))
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
@@ -1519,12 +1536,12 @@ def format_process_notification(evt: dict) -> "str | None":
         return text
 
     _exit = evt.get("exit_code", "?")
-    _out = evt.get("output", "")
     return (
         f"[IMPORTANT: Background process {_sid} completed "
         f"(exit code {_exit}).\n"
         f"Command: {_cmd}\n"
-        f"Output:\n{_out}]"
+        f"Output omitted from this synthetic message to keep the transcript readable.\n"
+        f"{_process_log_hint(_sid)}]"
     )
 
 

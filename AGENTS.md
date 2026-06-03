@@ -906,10 +906,12 @@ detects process completion and triggers a new agent turn. Control verbosity of b
 messages with `display.background_process_notifications`
 in config.yaml (or `HERMES_BACKGROUND_NOTIFICATIONS` env var):
 
-- `all` — running-output updates + final message (default)
+- `all` — running-output availability notices + final message (default)
 - `result` — only the final completion message
 - `error` — only the final message when exit code != 0
 - `off` — no watcher messages at all
+
+Watcher messages must stay chat-sized: include process id, exit code, command snippet, and a `process(action="log", session_id="...")` hint instead of pasting raw stdout/stderr into Discord, Telegram, or Desktop transcripts.
 
 ---
 
