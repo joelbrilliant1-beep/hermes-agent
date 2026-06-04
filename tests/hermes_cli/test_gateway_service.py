@@ -2579,3 +2579,271 @@ class TestServiceWorkingDirIsStable:
         assert m, "plist has no WorkingDirectory entry"
         assert Path(m.group(1)).resolve() == home.resolve()
         assert "/.worktrees/" not in m.group(1)
+
+
+class TestLaunchdUpdatePostflight:
+    """`hermes update` on macOS must refresh stale launchd service definitions
+    and restart every *loaded* gateway across all profiles — default and named —
+    without the user having to run `hermes gateway start` per profile.
+
+    Regression guard for two bugs:
+      1. `launchd_restart()` never refreshes a stale plist (launchd can't
+         hot-reload a definition — only bootout/bootstrap applies it), so a
+         kickstart respawns the stale code.
+      2. The update postflight only ever looked at the *current* profile's
+         LaunchAgent, leaving named-profile gateways on the old definition.
+
+    Every launchctl / signal side effect is mocked: no live `hermes gateway`
+    commands run, and no real launchctl is invoked.
+    """
+
+    @staticmethod
+    def _agents_dir(tmp_path, monkeypatch):
+        """Point the launchd user home (and therefore the LaunchAgents dir and
+        every per-profile plist path) at a throwaway tmp tree."""
+        machine_home = tmp_path / "machine-home"
+        agents = machine_home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(machine_home))
+        )
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        return agents
+
+    @staticmethod
+    def _write_stale_plist(path, hermes_home, label):
+        """Write a minimal, *stale* (does not match generate_launchd_plist())
+        plist that still records its HERMES_HOME, like a real install would."""
+        import plistlib
+
+        data = {
+            "Label": label,
+            "ProgramArguments": ["/usr/bin/python", "-m", "hermes_cli.main", "gateway", "run"],
+            "EnvironmentVariables": {"HERMES_HOME": str(hermes_home)},
+        }
+        with open(path, "wb") as fh:
+            plistlib.dump(data, fh)
+
+    # ----- discovery helpers -----
+
+    def test_reads_hermes_home_from_plist(self, tmp_path):
+        home = tmp_path / ".hermes" / "profiles" / "coder"
+        plist = tmp_path / "ai.hermes.gateway-coder.plist"
+        self._write_stale_plist(plist, home, "ai.hermes.gateway-coder")
+        assert gateway_cli._hermes_home_from_launchd_plist(plist) == str(home)
+
+    def test_reads_none_from_unparseable_plist(self, tmp_path):
+        garbage = tmp_path / "ai.hermes.gateway.plist"
+        garbage.write_text("not a plist at all", encoding="utf-8")
+        badxml = tmp_path / "ai.hermes.gateway-x.plist"
+        badxml.write_text("<plist><dict><key>oops", encoding="utf-8")
+        assert gateway_cli._hermes_home_from_launchd_plist(garbage) is None
+        assert gateway_cli._hermes_home_from_launchd_plist(badxml) is None
+
+    def test_iter_plists_empty_when_dir_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path / "nope"))
+        )
+        assert gateway_cli._iter_hermes_launchd_plists() == []
+
+    def test_iter_plists_discovers_default_and_named_only(self, tmp_path, monkeypatch):
+        agents = self._agents_dir(tmp_path, monkeypatch)
+        (agents / "ai.hermes.gateway.plist").write_text("<plist/>", encoding="utf-8")
+        (agents / "ai.hermes.gateway-coder.plist").write_text("<plist/>", encoding="utf-8")
+        (agents / "com.apple.other.plist").write_text("<plist/>", encoding="utf-8")
+        names = [p.name for p in gateway_cli._iter_hermes_launchd_plists()]
+        assert names == ["ai.hermes.gateway-coder.plist", "ai.hermes.gateway.plist"]
+
+    def test_service_loaded_check(self, monkeypatch):
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        assert gateway_cli._launchd_service_is_loaded("ai.hermes.gateway") is True
+        assert seen["cmd"] == ["launchctl", "list", "ai.hermes.gateway"]
+
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=113, stdout="", stderr=""),
+        )
+        assert gateway_cli._launchd_service_is_loaded("ai.hermes.gateway") is False
+
+        def boom(*a, **k):
+            raise FileNotFoundError("launchctl missing")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", boom)
+        assert gateway_cli._launchd_service_is_loaded("ai.hermes.gateway") is False
+
+    # ----- orchestrator: stale refresh across all loaded profiles (criteria 1-4) -----
+
+    def test_update_refreshes_stale_plists_for_all_loaded_profiles(self, tmp_path, monkeypatch):
+        agents = self._agents_dir(tmp_path, monkeypatch)
+        hermes_root = tmp_path / ".hermes"
+        coder_home = hermes_root / "profiles" / "coder"
+        coder_home.mkdir(parents=True)
+
+        default_plist = agents / "ai.hermes.gateway.plist"
+        coder_plist = agents / "ai.hermes.gateway-coder.plist"
+        self._write_stale_plist(default_plist, hermes_root, "ai.hermes.gateway")
+        self._write_stale_plist(coder_plist, coder_home, "ai.hermes.gateway-coder")
+
+        loaded = {"ai.hermes.gateway", "ai.hermes.gateway-coder"}
+        calls = []
+        drained = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["launchctl", "list"]:
+                rc = 0 if cmd[2] in loaded else 113
+                return SimpleNamespace(returncode=rc, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, drain_timeout: drained.append((pid, drain_timeout)) or True,
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+
+        restarted = gateway_cli.restart_launchd_gateways_for_update()
+
+        # Both loaded profiles handled; sorted glob order (named sorts first).
+        assert restarted == ["ai.hermes.gateway-coder", "ai.hermes.gateway"]
+
+        # Each stale plist was rewritten to the *current* definition, generated
+        # in its own profile context (named profile keeps its --profile arg).
+        default_text = default_plist.read_text(encoding="utf-8")
+        coder_text = coder_plist.read_text(encoding="utf-8")
+        assert "RunAtLoad" in default_text and "RunAtLoad" in coder_text
+        assert str(hermes_root.resolve()) in default_text
+        assert str(coder_home.resolve()) in coder_text
+        assert "<string>--profile</string>" in coder_text
+        assert "<string>coder</string>" in coder_text
+        assert "--profile" not in default_text
+
+        # launchd reloaded each definition (only bootout/bootstrap applies a
+        # changed plist), draining in-flight runs first.
+        domain = gateway_cli._launchd_domain()
+        assert ["launchctl", "bootout", f"{domain}/ai.hermes.gateway"] in calls
+        assert ["launchctl", "bootout", f"{domain}/ai.hermes.gateway-coder"] in calls
+        assert any(
+            c[:2] == ["launchctl", "bootstrap"] and c[-1] == str(default_plist) for c in calls
+        )
+        assert any(
+            c[:2] == ["launchctl", "bootstrap"] and c[-1] == str(coder_plist) for c in calls
+        )
+        assert drained == [(4242, 12.0), (4242, 12.0)]
+
+        # No live gateway commands: every subprocess invocation was launchctl.
+        assert calls and all(c and c[0] == "launchctl" for c in calls)
+
+    def test_update_restarts_without_refresh_when_definition_current(self, tmp_path, monkeypatch):
+        agents = self._agents_dir(tmp_path, monkeypatch)
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+        default_plist = agents / "ai.hermes.gateway.plist"
+        self._write_stale_plist(default_plist, hermes_root, "ai.hermes.gateway")
+
+        # Definition already matches the install -> a graceful restart re-execs
+        # the new code; no bootout/bootstrap reload is needed.
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        restart_calls = []
+        refresh_calls = []
+        monkeypatch.setattr(gateway_cli, "launchd_restart", lambda: restart_calls.append("restart"))
+        monkeypatch.setattr(
+            gateway_cli, "refresh_launchd_plist_if_needed", lambda: refresh_calls.append("refresh")
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        restarted = gateway_cli.restart_launchd_gateways_for_update()
+
+        assert restarted == ["ai.hermes.gateway"]
+        assert restart_calls == ["restart"]
+        assert refresh_calls == []
+        # The current plist was left untouched on disk.
+        assert "RunAtLoad" not in default_plist.read_text(encoding="utf-8")
+
+    def test_update_skips_unloaded_gateways(self, tmp_path, monkeypatch):
+        agents = self._agents_dir(tmp_path, monkeypatch)
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+        self._write_stale_plist(agents / "ai.hermes.gateway.plist", hermes_root, "ai.hermes.gateway")
+
+        restart_calls = []
+        refresh_calls = []
+        monkeypatch.setattr(gateway_cli, "launchd_restart", lambda: restart_calls.append("r"))
+        monkeypatch.setattr(
+            gateway_cli, "refresh_launchd_plist_if_needed", lambda: refresh_calls.append("f")
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=113, stdout="", stderr="not loaded"),
+        )
+
+        restarted = gateway_cli.restart_launchd_gateways_for_update()
+
+        assert restarted == []
+        assert restart_calls == [] and refresh_calls == []
+
+    def test_update_skips_plist_without_hermes_home(self, tmp_path, monkeypatch):
+        agents = self._agents_dir(tmp_path, monkeypatch)
+        (agents / "ai.hermes.gateway.plist").write_text("garbage", encoding="utf-8")
+
+        def explode(*a, **k):
+            raise AssertionError("no subprocess should run for an unreadable plist")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", explode)
+        assert gateway_cli.restart_launchd_gateways_for_update() == []
+
+    def test_update_continues_after_one_profile_fails(self, tmp_path, monkeypatch, capsys):
+        agents = self._agents_dir(tmp_path, monkeypatch)
+        hermes_root = tmp_path / ".hermes"
+        coder_home = hermes_root / "profiles" / "coder"
+        coder_home.mkdir(parents=True)
+        self._write_stale_plist(agents / "ai.hermes.gateway.plist", hermes_root, "ai.hermes.gateway")
+        self._write_stale_plist(
+            agents / "ai.hermes.gateway-coder.plist", coder_home, "ai.hermes.gateway-coder"
+        )
+
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        def flaky_restart():
+            # First profile (named, sorts first) blows up; second must still run.
+            if gateway_cli.get_launchd_label() == "ai.hermes.gateway-coder":
+                raise gateway_cli.subprocess.CalledProcessError(
+                    1, ["launchctl", "kickstart"], stderr="kaboom"
+                )
+
+        monkeypatch.setattr(gateway_cli, "launchd_restart", flaky_restart)
+
+        restarted = gateway_cli.restart_launchd_gateways_for_update()
+
+        assert restarted == ["ai.hermes.gateway"]
+        out = capsys.readouterr().out
+        assert "ai.hermes.gateway-coder" in out and "failed" in out.lower()
+
+    def test_update_no_op_when_no_plists_installed(self, tmp_path, monkeypatch):
+        self._agents_dir(tmp_path, monkeypatch)  # empty LaunchAgents dir
+
+        def explode(*a, **k):
+            raise AssertionError("no subprocess when there are no gateways")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", explode)
+        assert gateway_cli.restart_launchd_gateways_for_update() == []

@@ -9793,6 +9793,24 @@ def _cmd_update_pip(args):
     print("✓ Update complete! Restart hermes to use the new version.")
 
 
+def _restart_macos_launchd_gateways(restarted_services: list) -> None:
+    """macOS ``hermes update`` postflight: refresh stale launchd plists and
+    gracefully restart every *loaded* gateway across all profiles (default and
+    named), appending each restarted label to ``restarted_services``.
+
+    Delegates to :func:`hermes_cli.gateway.restart_launchd_gateways_for_update`,
+    which reloads stale service definitions (launchd can't hot-reload a plist)
+    and handles named-profile LaunchAgents — neither of which the previous
+    single-profile, refresh-less branch did.
+    """
+    try:
+        from hermes_cli.gateway import restart_launchd_gateways_for_update
+
+        restarted_services.extend(restart_launchd_gateways_for_update())
+    except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
+        pass
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -10938,31 +10956,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         pass
 
             # --- Launchd services (macOS) ---
+            # Refresh stale launchd definitions and gracefully restart every
+            # loaded gateway across all profiles (default + named).  launchd
+            # can't hot-reload a plist, so a stale definition needs a
+            # bootout/bootstrap reload — see restart_launchd_gateways_for_update.
             if is_macos():
-                try:
-                    from hermes_cli.gateway import (
-                        launchd_restart,
-                        get_launchd_label,
-                        get_launchd_plist_path,
-                    )
-
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
-                        check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
-                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
-                    pass
+                _restart_macos_launchd_gateways(restarted_services)
 
             # --- Manual (non-service) gateways ---
             # Kill any remaining gateway processes not managed by a service.

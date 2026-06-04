@@ -7,6 +7,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import logging
 import os
+import plistlib
 import shutil
 import signal
 import subprocess
@@ -3351,6 +3352,134 @@ def launchd_restart():
         )
         subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service restarted")
+
+
+def _launchd_agents_dir() -> Path:
+    """Directory holding the per-user launchd gateway plists."""
+    return _launchd_user_home() / "Library" / "LaunchAgents"
+
+
+def _iter_hermes_launchd_plists() -> list[Path]:
+    """Every installed Hermes gateway launchd plist (default + named profiles).
+
+    The launchd analogue of ``systemctl list-units hermes-gateway*``: every
+    profile's agent lives in the same per-user ``LaunchAgents`` directory,
+    named ``ai.hermes.gateway.plist`` (default) or
+    ``ai.hermes.gateway-<suffix>.plist`` (named profile / custom HERMES_HOME).
+    """
+    agents_dir = _launchd_agents_dir()
+    try:
+        return sorted(agents_dir.glob("ai.hermes.gateway*.plist"))
+    except OSError:
+        return []
+
+
+def _hermes_home_from_launchd_plist(plist_path: Path) -> str | None:
+    """Return the HERMES_HOME a launchd plist was generated for, or ``None``.
+
+    The plist authoritatively records its own profile home in
+    ``EnvironmentVariables.HERMES_HOME`` (see :func:`generate_launchd_plist`),
+    so the caller can re-enter that profile's context without reversing the
+    label suffix.  Unreadable / malformed plists yield ``None`` (skip them).
+    """
+    from xml.parsers.expat import ExpatError
+
+    try:
+        with plist_path.open("rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, ValueError, ExpatError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    env = data.get("EnvironmentVariables")
+    if not isinstance(env, dict):
+        return None
+    home = env.get("HERMES_HOME")
+    return str(home) if home else None
+
+
+def _launchd_service_is_loaded(label: str) -> bool:
+    """Whether ``launchctl list <label>`` reports the job as loaded."""
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def restart_launchd_gateways_for_update(drain_timeout: float | None = None) -> list[str]:
+    """Refresh stale launchd definitions and restart every *loaded* gateway.
+
+    Used by the macOS ``hermes update`` postflight.  Two reasons the plain
+    :func:`launchd_restart` is not enough here:
+
+    * **Stale definitions.** launchd never hot-reloads a plist — a changed
+      definition is only applied by ``bootout``/``bootstrap``
+      (:func:`refresh_launchd_plist_if_needed`).  ``launchd_restart`` is the
+      fast, graceful path for a *current* definition and deliberately skips the
+      refresh, so the update path must reload stale definitions itself.
+    * **Named profiles.** Every profile has its own LaunchAgent; the old
+      postflight only ever touched the current profile's, leaving named-profile
+      gateways pinned to the previous code.
+
+    Each discovered plist is handled in its own HERMES_HOME context (via the
+    ``_HERMES_HOME_OVERRIDE`` ContextVar) so its regenerated definition matches
+    that profile.  Only *loaded* services are touched; in-flight agent runs are
+    drained gracefully (SIGUSR1) before a stale definition is reloaded.
+
+    Returns the launchd labels that were restarted/refreshed.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from gateway.status import get_running_pid
+
+    restarted: list[str] = []
+    for plist_path in _iter_hermes_launchd_plists():
+        home = _hermes_home_from_launchd_plist(plist_path)
+        if not home:
+            continue
+        token = set_hermes_home_override(home)
+        try:
+            label = get_launchd_label()
+            # Guard against corrupt / foreign plists: only act when this profile
+            # context resolves back to the very file we discovered.
+            if get_launchd_plist_path().resolve() != plist_path.resolve():
+                continue
+            if not _launchd_service_is_loaded(label):
+                continue  # never touch a gateway that isn't loaded
+            if launchd_plist_is_current():
+                # Definition already matches; a graceful restart re-execs the
+                # new code without a bootout/bootstrap cycle.
+                launchd_restart()
+            else:
+                # Stale definition: launchd must reload it.  Drain in-flight
+                # agent runs gracefully (SIGUSR1) first so we don't SIGKILL
+                # them, then rewrite the plist and bootout/bootstrap.
+                pid = get_running_pid()
+                if pid is not None:
+                    if drain_timeout is None:
+                        drain_timeout = _get_restart_drain_timeout()
+                    _graceful_restart_via_sigusr1(pid, drain_timeout=drain_timeout)
+                refresh_launchd_plist_if_needed()
+            restarted.append(label)
+        except (
+            subprocess.CalledProcessError,
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+        ) as e:
+            stderr = (getattr(e, "stderr", "") or "").strip()
+            detail = f": {stderr}" if stderr else ""
+            print(f"  ⚠ Gateway restart failed for {get_launchd_label()}{detail}")
+        finally:
+            reset_hermes_home_override(token)
+    return restarted
 
 
 def launchd_status(deep: bool = False):

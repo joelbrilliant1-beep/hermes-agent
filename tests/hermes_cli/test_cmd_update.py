@@ -830,3 +830,32 @@ termux = ["rich>=14"]
 
     assert hm._load_installable_optional_extras(group="all") == ["mcp"]
     assert hm._load_installable_optional_extras(group="termux-all") == ["termux", "mcp"]
+
+
+class TestRestartMacosLaunchdGatewaysPostflight:
+    """The macOS update postflight delegates to the gateway orchestrator and
+    records every restarted launchd label, without running live commands."""
+
+    def test_extends_restarted_services_with_orchestrator_result(self, monkeypatch):
+        import hermes_cli.main as main
+
+        monkeypatch.setattr(
+            "hermes_cli.gateway.restart_launchd_gateways_for_update",
+            lambda: ["ai.hermes.gateway", "ai.hermes.gateway-coder"],
+        )
+        restarted = []
+        main._restart_macos_launchd_gateways(restarted)
+        assert restarted == ["ai.hermes.gateway", "ai.hermes.gateway-coder"]
+
+    def test_swallows_orchestrator_errors(self, monkeypatch):
+        import hermes_cli.main as main
+
+        def boom():
+            raise subprocess.TimeoutExpired(cmd="launchctl", timeout=5)
+
+        monkeypatch.setattr(
+            "hermes_cli.gateway.restart_launchd_gateways_for_update", boom
+        )
+        restarted = ["existing-service"]
+        main._restart_macos_launchd_gateways(restarted)  # must not raise
+        assert restarted == ["existing-service"]
