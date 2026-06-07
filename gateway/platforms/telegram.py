@@ -1878,6 +1878,7 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
+            dm_topic_plain_fallback = False
             
             try:
                 from telegram.error import NetworkError as _NetErr
@@ -1908,30 +1909,40 @@ class TelegramAdapter(BasePlatformAdapter):
                     and self._reply_to_mode == "off"
                     and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
                 )
-                reply_to_source = reply_to or (
-                    str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
-                )
-                if private_dm_topic_send:
-                    should_thread = (
-                        reply_to_source is not None
-                        and self._reply_to_mode != "off"
-                    )
+                if dm_topic_plain_fallback and private_dm_topic_send:
+                    # Telegram can continue surfacing user messages from a
+                    # stale/deleted private DM topic while rejecting bot sends
+                    # with "Message thread not found". Once that happens, keep
+                    # the processed reply deliverable by sending subsequent
+                    # text chunks as plain DM messages instead of looping
+                    # through the same dead topic metadata.
+                    reply_to_id = None
+                    thread_kwargs = {}
                 else:
-                    should_thread = self._should_thread_reply(reply_to_source, i)
-                reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
-                if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
-                    return SendResult(
-                        success=False,
-                        error=self._dm_topic_missing_anchor_error(),
-                        retryable=False,
+                    reply_to_source = reply_to or (
+                        str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
                     )
-                thread_kwargs = self._thread_kwargs_for_send(
-                    chat_id,
-                    thread_id,
-                    metadata,
-                    reply_to_message_id=reply_to_id,
-                    reply_to_mode=self._reply_to_mode,
-                )
+                    if private_dm_topic_send:
+                        should_thread = (
+                            reply_to_source is not None
+                            and self._reply_to_mode != "off"
+                        )
+                    else:
+                        should_thread = self._should_thread_reply(reply_to_source, i)
+                    reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+                    if private_dm_topic_send and reply_to_id is None and not dm_topic_reply_to_off:
+                        return SendResult(
+                            success=False,
+                            error=self._dm_topic_missing_anchor_error(),
+                            retryable=False,
+                        )
+                    thread_kwargs = self._thread_kwargs_for_send(
+                        chat_id,
+                        thread_id,
+                        metadata,
+                        reply_to_message_id=reply_to_id,
+                        reply_to_mode=self._reply_to_mode,
+                    )
                 if used_thread_fallback and thread_kwargs.get("message_thread_id") is not None:
                     thread_kwargs = dict(thread_kwargs)
                     thread_kwargs["message_thread_id"] = None
@@ -1975,7 +1986,19 @@ class TelegramAdapter(BasePlatformAdapter):
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                if private_dm_topic_send:
+                                    logger.warning(
+                                        "[%s] Telegram DM topic thread %s not found, retrying as plain DM",
+                                        self.name,
+                                        effective_thread_id,
+                                    )
+                                    dm_topic_plain_fallback = True
+                                    used_thread_fallback = True
+                                    reply_to_id = None
+                                    effective_thread_id = None
+                                    thread_kwargs = {}
+                                    continue
+                                if metadata and metadata.get("telegram_dm_topic_created_for_send"):
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
