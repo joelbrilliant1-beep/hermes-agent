@@ -627,6 +627,44 @@ async def test_send_uses_reply_anchor_when_direct_topic_fallback_metadata_exists
 
 
 @pytest.mark.asyncio
+async def test_send_dm_topic_thread_not_found_retries_plain_dm():
+    """Deleted Hermes DM topics must not black-hole completed text replies."""
+    adapter = _make_adapter()
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        if len(call_log) == 1:
+            raise FakeBadRequest("Message thread not found")
+        return SimpleNamespace(message_id=781)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="test message",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "20197",
+            "telegram_reply_to_message_id": "462",
+        },
+    )
+
+    assert result.success is True
+    assert result.message_id == "781"
+    assert result.raw_response["requested_thread_id"] == 20197
+    assert result.raw_response["thread_fallback"] is True
+    assert len(call_log) == 2
+    assert call_log[0]["reply_to_message_id"] == 462
+    assert call_log[0]["message_thread_id"] == 20197
+    assert "direct_messages_topic_id" not in call_log[0]
+    assert call_log[1]["reply_to_message_id"] is None
+    assert "message_thread_id" not in call_log[1]
+    assert "direct_messages_topic_id" not in call_log[1]
+
+
+@pytest.mark.asyncio
 async def test_send_created_private_topic_uses_message_thread_without_anchor():
     """Topics created via createForumTopic are addressable by message_thread_id directly."""
     adapter = _make_adapter()
