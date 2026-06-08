@@ -297,36 +297,31 @@ class TestPeerLookupHelpers:
             search_query="assistant",
         )
 
-    def test_get_prefetch_context_fetches_user_and_ai_from_peer_api(self):
+    def test_get_prefetch_context_fetches_user_from_assistant_perspective_and_ai_self(self):
         mgr, session = self._make_cached_manager()
-        user_peer = MagicMock()
-        user_peer.context.return_value = SimpleNamespace(
-            representation="User representation",
-            peer_card=["Name: Robert"],
-        )
-        ai_peer = MagicMock()
-        ai_peer.context.side_effect = lambda **kwargs: SimpleNamespace(
+        assistant_peer = MagicMock()
+        assistant_peer.context.side_effect = lambda **kwargs: SimpleNamespace(
             representation=(
                 "AI representation" if kwargs.get("target") == session.assistant_peer_id
-                else "Mixed representation"
+                else "User representation from assistant perspective"
             ),
             peer_card=(
                 ["Role: Assistant"] if kwargs.get("target") == session.assistant_peer_id
                 else ["Name: Robert"]
             ),
         )
-        mgr._get_or_create_peer = MagicMock(side_effect=[user_peer, ai_peer])
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
 
         result = mgr.get_prefetch_context(session.key)
 
         assert result == {
-            "representation": "User representation",
+            "representation": "User representation from assistant perspective",
             "card": "Name: Robert",
             "ai_representation": "AI representation",
             "ai_card": "Role: Assistant",
         }
-        user_peer.context.assert_called_once_with(target=session.user_peer_id)
-        ai_peer.context.assert_called_once_with(target=session.assistant_peer_id)
+        assert assistant_peer.context.call_args_list[0].kwargs == {"target": session.user_peer_id}
+        assert assistant_peer.context.call_args_list[1].kwargs == {"target": session.assistant_peer_id}
 
     def test_get_ai_representation_uses_peer_api(self):
         mgr, session = self._make_cached_manager()
@@ -702,6 +697,69 @@ class TestToolsModeInitBehavior:
         assert mock_manager_cls.call_args.kwargs["runtime_user_peer_name_alt"] == "union-id"
 
 
+class TestMemoryFileMigrationIdempotency:
+    def _make_manager(self, honcho_session):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="test-session",
+            user_peer_id="joel",
+            assistant_peer_id="default",
+            honcho_session_id="test-session",
+        )
+        mgr._cache["test-session"] = session
+        mgr._sessions_cache["test-session"] = honcho_session
+        mgr._peers_cache["joel"] = MagicMock(name="user_peer")
+        mgr._peers_cache["default"] = MagicMock(name="assistant_peer")
+        return mgr
+
+    def test_existing_local_memory_messages_skip_upload_and_set_marker(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("durable memory", encoding="utf-8")
+        honcho_session = MagicMock()
+        honcho_session.get_metadata.return_value = {}
+        honcho_session.messages.return_value = SimpleNamespace(
+            items=[SimpleNamespace(metadata={"source": "local_memory", "original_file": "MEMORY.md"})]
+        )
+        mgr = self._make_manager(honcho_session)
+
+        assert mgr.migrate_memory_files("test-session", str(tmp_path)) is False
+
+        honcho_session.upload_file.assert_not_called()
+        honcho_session.set_metadata.assert_called_once()
+        written = honcho_session.set_metadata.call_args.args[0]
+        assert written["hermes_memory_files_migrated"] is True
+        assert written["hermes_memory_files_migrated_reason"] == "existing_local_memory_messages"
+
+    def test_marker_skips_upload_without_scanning_messages(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("durable memory", encoding="utf-8")
+        honcho_session = MagicMock()
+        honcho_session.get_metadata.return_value = {"hermes_memory_files_migrated": True}
+        mgr = self._make_manager(honcho_session)
+
+        assert mgr.migrate_memory_files("test-session", str(tmp_path)) is False
+
+        honcho_session.messages.assert_not_called()
+        honcho_session.upload_file.assert_not_called()
+
+    def test_upload_marks_session_after_success(self, tmp_path):
+        (tmp_path / "MEMORY.md").write_text("memory", encoding="utf-8")
+        (tmp_path / "USER.md").write_text("user", encoding="utf-8")
+        (tmp_path / "SOUL.md").write_text("soul", encoding="utf-8")
+        honcho_session = MagicMock()
+        honcho_session.get_metadata.return_value = {"existing": "kept"}
+        honcho_session.messages.return_value = SimpleNamespace(items=[])
+        mgr = self._make_manager(honcho_session)
+
+        assert mgr.migrate_memory_files("test-session", str(tmp_path)) is True
+
+        assert honcho_session.upload_file.call_count == 3
+        honcho_session.set_metadata.assert_called_once()
+        written = honcho_session.set_metadata.call_args.args[0]
+        assert written["existing"] == "kept"
+        assert written["hermes_memory_files_migrated"] is True
+        assert written["hermes_memory_files_migrated_reason"] == "uploaded_local_memory_files"
+        assert written["hermes_memory_files_migrated_files"] == ["MEMORY.md", "SOUL.md", "USER.md"]
+
+
 class TestPerSessionMigrateGuard:
     """Verify migrate_memory_files is skipped under per-session strategy.
 
@@ -914,6 +972,26 @@ def _settle_prewarm(provider):
             provider._manager.prefetch_context.reset_mock()
         except AttributeError:
             pass
+
+
+class TestFirstTurnJoinTimeout:
+    def test_http_timeout_does_not_make_auto_injection_block_long(self):
+        """Self-hosted Honcho may need long HTTP timeouts for explicit tools;
+        auto-injection still caps first-turn waiting so responses fail open."""
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(timeout=90)
+
+        assert provider._first_turn_join_timeout() == provider._FIRST_TURN_JOIN_MAX_SECONDS
+
+    def test_short_http_timeout_is_respected_for_first_turn_join(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        provider = HonchoMemoryProvider()
+        provider._config = HonchoClientConfig(timeout=3)
+
+        assert provider._first_turn_join_timeout() == 3.0
 
 
 class TestDialecticCadenceDefaults:
