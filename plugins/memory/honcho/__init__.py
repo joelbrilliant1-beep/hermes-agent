@@ -707,9 +707,7 @@ class HonchoMemoryProvider(MemoryProvider):
             self._last_dialectic_turn = self._turn_count
 
         if self._last_dialectic_turn == -999 and query:
-            _first_turn_timeout = (
-                self._config.timeout if self._config and self._config.timeout else 8.0
-            )
+            _first_turn_timeout = self._first_turn_join_timeout()
             _fired_at = self._turn_count
 
             def _run_first_turn() -> None:
@@ -900,6 +898,21 @@ class HonchoMemoryProvider(MemoryProvider):
     # Cap on the empty-streak backoff so a persistently silent backend
     # eventually settles on a ceiling instead of unbounded widening.
     _BACKOFF_MAX = 8
+
+    # Cap how long prefetch() blocks a user turn waiting for a first-turn
+    # dialectic response. This must stay independent of HTTP request timeout:
+    # local/self-hosted models may need 60-90s to complete explicit
+    # honcho_reasoning calls, but auto-injection should fail open quickly and
+    # let the background thread surface the result later.
+    _FIRST_TURN_JOIN_MAX_SECONDS = 8.0
+
+    def _first_turn_join_timeout(self) -> float:
+        configured = (
+            self._config.timeout
+            if self._config and self._config.timeout
+            else self._FIRST_TURN_JOIN_MAX_SECONDS
+        )
+        return min(float(configured), self._FIRST_TURN_JOIN_MAX_SECONDS)
 
     def _thread_is_live(self) -> bool:
         """Thread-alive guard that treats threads older than the stale
