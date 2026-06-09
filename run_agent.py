@@ -1547,6 +1547,13 @@ class AIAgent:
             if not self._session_db_created:
                 self._ensure_db_session()
             start_idx = len(conversation_history) if conversation_history else 0
+            if start_idx > len(messages):
+                # A compression split replaces the working message list with a
+                # shorter compressed transcript while some callers may still
+                # hold the pre-compression history.  That stale offset would
+                # skip every compressed message and leave the continuation
+                # session empty, so ignore it and let the flush cursor dedup.
+                start_idx = 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")

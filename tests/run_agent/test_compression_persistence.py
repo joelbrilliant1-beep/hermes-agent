@@ -4,16 +4,20 @@ Verifies that when context compression fires during run_conversation(),
 the compressed messages are properly persisted to both SQLite (via the
 agent) and JSONL (via the gateway).
 
-Bug scenario (pre-fix):
+Bug scenario:
   1. Gateway loads 200-message history, passes to agent
   2. Agent's run_conversation() compresses to ~30 messages mid-run
   3. _compress_context() resets _last_flushed_db_idx = 0
-  4. On exit, _flush_messages_to_session_db() calculates:
+  4. Pre-fix, _flush_messages_to_session_db() calculated:
      flush_from = max(len(conversation_history=200), _last_flushed_db_idx=0) = 200
   5. messages[200:] is empty (only ~30 messages after compression)
   6. Nothing written to new session's SQLite — compressed context lost
   7. Gateway's history_offset was still 200, producing empty new_messages
   8. Fallback wrote only user/assistant pair — summary lost
+
+The regression fix ignores a stale history offset when it is longer than the
+current compressed message list, so the continuation receives the compacted
+summary and tail instead of staying empty.
 """
 
 import os
@@ -52,8 +56,9 @@ class TestFlushAfterCompression:
 
         Before the fix, flush_from = max(len(conversation_history), 0) = 200,
         but messages only has ~30 entries, so messages[200:] is empty.
-        After the fix, conversation_history is cleared to None after compression,
-        so flush_from = max(0, 0) = 0, and ALL compressed messages are written.
+        After the fix, the stale history offset is ignored when it is longer
+        than the current compressed message list, so all compressed messages
+        are written.
         """
         from hermes_state import SessionDB
 
@@ -89,10 +94,11 @@ class TestFlushAfterCompression:
                 {"role": "assistant", "content": "new answer"},
             ]
 
-            # THE BUG: passing the original history as conversation_history
-            # causes flush_from = max(200, 0) = 200, skipping everything.
-            # After the fix, conversation_history should be None.
-            agent._flush_messages_to_session_db(compressed_messages, None)
+            # THE BUG: callers can still pass the original history after the
+            # compression-created session rotation.  The flush layer must not
+            # treat that stale pre-compression length as an offset into the
+            # shorter compressed message list.
+            agent._flush_messages_to_session_db(compressed_messages, original_history)
 
             new_rows = db.get_messages("compressed-session")
             assert len(new_rows) == 5, (
@@ -100,8 +106,8 @@ class TestFlushAfterCompression:
                 f"Compression persistence bug: messages not written to SQLite."
             )
 
-    def test_flush_with_stale_history_loses_messages(self):
-        """Demonstrates the bug condition: stale conversation_history causes data loss."""
+    def test_flush_with_stale_history_after_rotation_writes_compressed_messages(self):
+        """Stale conversation_history after rotation writes the compressed transcript."""
         from hermes_state import SessionDB
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -120,17 +126,41 @@ class TestFlushAfterCompression:
                 {"role": "assistant", "content": "continuing..."},
             ]
 
-            # Bug: passing a conversation_history longer than compressed messages
+            # Stale pre-compression history is longer than the new compressed
+            # transcript.  This used to produce flush_from=100 and write zero
+            # messages to the new continuation session.
             stale_history = [{"role": "user", "content": f"msg{i}"} for i in range(100)]
             agent._flush_messages_to_session_db(compressed, stale_history)
 
             rows = db.get_messages("new-session")
-            # With the stale history, flush_from = max(100, 0) = 100
-            # But compressed only has 2 entries → messages[100:] = empty
-            assert len(rows) == 0, (
-                "Expected 0 messages with stale conversation_history "
-                "(this test verifies the bug condition exists)"
-            )
+            assert [row["content"] for row in rows] == ["summary", "continuing..."]
+            assert agent._last_flushed_db_idx == len(compressed)
+
+    def test_valid_history_prefix_still_dedups_without_compression(self):
+        """Normal no-compression flushes still skip the already-persisted prefix."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+
+            agent = self._make_agent(db)
+            agent._ensure_db_session()
+
+            conversation_history = [
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+            ]
+            messages = conversation_history + [
+                {"role": "user", "content": "new question"},
+                {"role": "assistant", "content": "new answer"},
+            ]
+
+            agent._flush_messages_to_session_db(messages, conversation_history)
+            agent._flush_messages_to_session_db(messages, conversation_history)
+
+            rows = db.get_messages("original-session")
+            assert [row["content"] for row in rows] == ["new question", "new answer"]
 
 
 # ---------------------------------------------------------------------------
@@ -188,16 +218,15 @@ class TestGatewayHistoryOffsetAfterSplit:
             f"Expected all 5 messages with offset=0, got {len(new_messages)}"
         )
 
-    def test_new_messages_empty_with_stale_offset(self):
-        """Demonstrates the bug: stale offset produces empty new_messages."""
+    def test_new_messages_not_empty_when_split_resets_stale_offset(self):
+        """A session split ignores the stale pre-compression gateway offset."""
         agent_messages = [
             {"role": "user", "content": "summary"},
             {"role": "assistant", "content": "answer"},
         ]
-        # Bug: offset is the pre-compression history length
-        history_offset = 200
+        stale_history_offset = 200
+        session_was_split = True
+        history_offset = 0 if session_was_split else stale_history_offset
 
         new_messages = agent_messages[history_offset:] if len(agent_messages) > history_offset else []
-        assert len(new_messages) == 0, (
-            "Expected 0 messages with stale offset=200 (demonstrates the bug)"
-        )
+        assert new_messages == agent_messages
