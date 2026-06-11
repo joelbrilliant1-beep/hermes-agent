@@ -44,8 +44,24 @@ def _source() -> SessionSource:
     )
 
 
-def _seed_expired_session(store: SessionStore, sid: str = "old-session") -> tuple[SessionSource, str]:
-    source = _source()
+def _telegram_topic_source() -> SessionSource:
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="6667473435",
+        chat_id="6667473435",
+        chat_type="dm",
+        user_name="Joel",
+        chat_name="₿rill",
+        thread_id="21389",
+    )
+
+
+def _seed_expired_session(
+    store: SessionStore,
+    sid: str = "old-session",
+    source: SessionSource | None = None,
+) -> tuple[SessionSource, str]:
+    source = source or _source()
     session_key = build_session_key(
         source,
         group_sessions_per_user=store.config.group_sessions_per_user,
@@ -225,3 +241,97 @@ async def test_gateway_handler_triggers_reset_and_injects_handoff_into_agent_cal
     assert new_row["parent_session_id"] == "old-session"
     adapter.send.assert_awaited()
     assert "continuity handoff was preserved" in adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_telegram_topic_binding_rebinds_to_auto_reset_child(store):
+    """A stale Telegram topic binding must not switch away from an auto-reset child."""
+    source, session_key = _seed_expired_session(store, source=_telegram_topic_source())
+    assert source.user_id is not None
+    assert source.chat_id is not None
+    assert source.thread_id is not None
+    db = cast(SessionDB, store._db)
+    db.enable_telegram_topic_mode(chat_id=source.chat_id, user_id=source.user_id)
+    db.bind_telegram_topic(
+        chat_id=source.chat_id,
+        thread_id=source.thread_id,
+        user_id=source.user_id,
+        session_key=session_key,
+        session_id="old-session",
+    )
+
+    event = MessageEvent(text="keep going please", source=source, message_id="m-telegram")
+    runner = object.__new__(GatewayRunner)
+    runner_any = cast(Any, runner)
+    runner_any.config = store.config
+    runner_any.session_store = store
+    runner_any._session_db = db
+    runner_any.hooks = SimpleNamespace(emit=AsyncMock())
+    adapter = SimpleNamespace(send=AsyncMock(), stop_typing=AsyncMock())
+    runner_any.adapters = {Platform.TELEGRAM: adapter}
+    runner_any._session_model_overrides = {}
+    runner_any._session_reasoning_overrides = {}
+    runner_any._pending_model_notes = {}
+    runner_any._background_tasks = set()
+    runner_any._show_reasoning = False
+
+    runner_any._cache_session_source = lambda *_args, **_kwargs: None
+    runner_any._set_session_reasoning_override = lambda *_args, **_kwargs: None
+    runner_any._format_session_info = lambda: ""
+    runner_any._thread_metadata_for_source = lambda *_args, **_kwargs: {}
+    runner_any._reply_anchor_for_event = lambda event: event.message_id
+    runner_any._set_session_env = lambda context: []
+    runner_any._clear_session_env = lambda tokens: None
+    runner_any._bind_adapter_run_generation = lambda *_args, **_kwargs: None
+    runner_any._is_session_run_current = lambda *_args, **_kwargs: True
+    runner_any._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner_any._deliver_platform_notice = AsyncMock()
+
+    async def _prepare_inbound_message_text(**kwargs: Any) -> str:
+        return kwargs["event"].text
+
+    captured: dict[str, Any] = {}
+
+    async def _run_agent(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+            "last_prompt_tokens": 0,
+        }
+
+    runner_any._prepare_inbound_message_text = _prepare_inbound_message_text
+    runner_any._run_agent = _run_agent
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        _quick_key=session_key,
+        run_generation=1,
+    )
+
+    assert response == "ok"
+    assert captured["session_id"] != "old-session"
+    context_prompt = captured["context_prompt"]
+    assert context_prompt.startswith("[SESSION RESET HANDOFF]")
+    assert "Previous session id: old-session" in context_prompt
+    assert "fresh conversation with no prior context" not in context_prompt
+
+    child = db.get_session(captured["session_id"])
+    assert child is not None
+    assert child["parent_session_id"] == "old-session"
+    assert child["end_reason"] is None
+    old = db.get_session("old-session")
+    assert old is not None
+    assert old["end_reason"] == "session_reset"
+
+    binding = db.get_telegram_topic_binding(
+        chat_id=source.chat_id,
+        thread_id=source.thread_id,
+    )
+    assert binding is not None
+    assert binding["session_id"] == captured["session_id"]
+    entry = store._entries[session_key]
+    assert entry.session_id == captured["session_id"]
