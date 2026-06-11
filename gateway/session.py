@@ -519,6 +519,8 @@ class SessionEntry:
     was_auto_reset: bool = False
     auto_reset_reason: Optional[str] = None  # "idle" or "daily"
     reset_had_activity: bool = False  # whether the expired session had any messages
+    parent_session_id: Optional[str] = None
+    reset_handoff: Optional[str] = None
 
     # Set by reset_session() when the user explicitly sends /new or /reset.
     # Consumed once by _handle_message_with_agent to trigger topic/channel
@@ -582,6 +584,8 @@ class SessionEntry:
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
+            "parent_session_id": self.parent_session_id,
+            "reset_handoff": self.reset_handoff,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -644,6 +648,8 @@ class SessionEntry:
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
+            parent_session_id=data.get("parent_session_id"),
+            reset_handoff=data.get("reset_handoff"),
         )
 
 
@@ -1019,6 +1025,130 @@ class SessionStore:
             self._ensure_loaded_locked()
             return len(self._entries) > 1
 
+    @staticmethod
+    def _handoff_excerpt(value: Any, limit: int = 700) -> str:
+        """Return a single-line bounded excerpt safe for reset handoffs."""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            try:
+                value = json.dumps(value, ensure_ascii=False)
+            except Exception:
+                value = str(value)
+        value = " ".join(value.split())
+        if len(value) > limit:
+            return value[: max(0, limit - 1)].rstrip() + "…"
+        return value
+
+    @staticmethod
+    def _extract_todo_handoff(content: Any) -> Optional[str]:
+        """Extract a compact todo-state line from the latest todo tool output."""
+        if not isinstance(content, str) or not content.strip():
+            return None
+        try:
+            payload = json.loads(content)
+        except Exception:
+            return SessionStore._handoff_excerpt(content, 500)
+        todos = payload.get("todos") if isinstance(payload, dict) else None
+        if not isinstance(todos, list):
+            return SessionStore._handoff_excerpt(content, 500)
+        parts = []
+        for status in ("in_progress", "pending", "completed"):
+            matching = [t for t in todos if isinstance(t, dict) and t.get("status") == status]
+            if not matching:
+                continue
+            labels = [SessionStore._handoff_excerpt(t.get("content"), 160) for t in matching[:4]]
+            labels = [label for label in labels if label]
+            if labels:
+                parts.append(f"{status}: " + "; ".join(labels))
+        return " | ".join(parts) if parts else None
+
+    def _session_had_activity(self, entry: SessionEntry) -> bool:
+        """Return True when the expiring session has any persisted messages."""
+        if entry.total_tokens > 0:
+            return True
+        if not self._db:
+            return False
+        try:
+            row = self._db.get_session(entry.session_id)
+            if row and int(row.get("message_count") or 0) > 0:
+                return True
+            return bool(self._db.get_messages(entry.session_id))
+        except Exception:
+            return False
+
+    def _build_reset_handoff(self, entry: SessionEntry, reset_reason: str) -> str:
+        """Build a deterministic model-visible handoff for auto-reset sessions.
+
+        This is deliberately local and non-LLM. Auto-reset is a continuity
+        boundary, so the fallback must work even when auxiliary compression is
+        unavailable or the gateway is finalising sessions unattended.
+        """
+        previous_id = entry.session_id
+        title = ""
+        messages: List[Dict[str, Any]] = []
+        raw_messages: List[Dict[str, Any]] = []
+        if self._db:
+            try:
+                row = self._db.get_session(previous_id) or {}
+                title = row.get("title") or ""
+            except Exception:
+                title = ""
+            try:
+                messages = self._db.get_messages_as_conversation(previous_id)
+            except Exception:
+                messages = []
+            try:
+                raw_messages = self._db.get_messages(previous_id)
+            except Exception:
+                raw_messages = []
+
+        user_assistant = [
+            m for m in messages
+            if m.get("role") in {"user", "assistant"} and m.get("content")
+        ]
+        latest_user = next((m for m in reversed(user_assistant) if m.get("role") == "user"), None)
+        last_active_task = self._handoff_excerpt(
+            latest_user.get("content") if latest_user else "",
+            300,
+        ) or "unknown"
+
+        recent_lines = []
+        for m in user_assistant[-10:]:
+            role = "User" if m.get("role") == "user" else "Assistant"
+            excerpt = self._handoff_excerpt(m.get("content"), 700 if role == "User" else 500)
+            if excerpt:
+                recent_lines.append(f"- {role}: {excerpt}")
+
+        tool_counts: Dict[str, int] = {}
+        latest_todo = None
+        for row in raw_messages:
+            name = row.get("tool_name")
+            if name:
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+                if name == "todo":
+                    latest_todo = row.get("content")
+        top_tools = sorted(tool_counts.items(), key=lambda item: (-item[1], item[0]))[:8]
+        tool_summary = ", ".join(f"{name}×{count}" for name, count in top_tools) or "none recorded"
+        todo_summary = self._extract_todo_handoff(latest_todo) if latest_todo is not None else None
+
+        lines = [
+            "[SESSION RESET HANDOFF]",
+            "This conversation was automatically reset, but it is not context-free.",
+            f"Previous session id: {previous_id}",
+            f"Previous title: {title or '(untitled)'}",
+            f"Reset reason: {reset_reason}",
+            f"Last active task, inferred from the latest user message: {last_active_task}",
+            "Continuation rule: if the user says 'keep going', 'continue', or similar, continue the previous active task only if this handoff is sufficient; otherwise ask one pointed re-anchoring question before taking action.",
+            "Recent exact excerpts:",
+        ]
+        lines.extend(recent_lines or ["- No recent user/assistant excerpts were available."])
+        lines.append(f"Tool/action summary: {tool_summary}")
+        if todo_summary:
+            lines.append(f"Latest todo state: {todo_summary}")
+        lines.append("[/SESSION RESET HANDOFF]")
+        return "\n".join(lines)
+
     def get_or_create_session(
         self,
         source: SessionSource,
@@ -1037,6 +1167,8 @@ class SessionStore:
         # All _entries / _loaded mutations are protected by self._lock.
         db_end_session_id = None
         db_create_kwargs = None
+        parent_session_id = None
+        reset_handoff = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -1069,16 +1201,23 @@ class SessionStore:
                     self._save()
                     return entry
                 else:
-                    # Session is being auto-reset.
+                    # Session is being auto-reset. Build a deterministic
+                    # handoff before switching the session id so ambiguous
+                    # follow-ups like "keep going" can re-anchor to the
+                    # previous conversation instead of falling back to static
+                    # memory.
                     was_auto_reset = True
                     auto_reset_reason = reset_reason
-                    # Track whether the expired session had any real conversation
-                    reset_had_activity = entry.total_tokens > 0
+                    reset_had_activity = self._session_had_activity(entry)
+                    parent_session_id = entry.session_id
+                    reset_handoff = self._build_reset_handoff(entry, reset_reason)
                     db_end_session_id = entry.session_id
             else:
                 was_auto_reset = False
                 auto_reset_reason = None
                 reset_had_activity = False
+                parent_session_id = None
+                reset_handoff = None
 
             # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -1095,6 +1234,8 @@ class SessionStore:
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                parent_session_id=parent_session_id,
+                reset_handoff=reset_handoff,
             )
 
             self._entries[session_key] = entry
@@ -1103,6 +1244,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "parent_session_id": parent_session_id,
             }
 
         # SQLite operations outside the lock
