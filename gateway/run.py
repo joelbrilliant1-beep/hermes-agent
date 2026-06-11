@@ -8832,6 +8832,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _prepend_auto_reset_handoff(context_prompt: str, session_entry) -> str:
+        """Prepend deterministic reset continuity context for model-visible prompts."""
+        if not getattr(session_entry, 'was_auto_reset', False):
+            return context_prompt
+        reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
+        context_note = getattr(session_entry, 'reset_handoff', None)
+        if not context_note:
+            previous_id = getattr(session_entry, 'parent_session_id', None) or '(unknown)'
+            context_note = (
+                "[SESSION RESET HANDOFF]\n"
+                "This conversation was automatically reset, but it is not context-free.\n"
+                f"Previous session id: {previous_id}\n"
+                f"Reset reason: {reset_reason}\n"
+                "No deterministic excerpts were available. If the user's next message is ambiguous, ask one pointed re-anchoring question before taking action.\n"
+                "[/SESSION RESET HANDOFF]"
+            )
+        return context_note + "\n\n" + context_prompt
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -8967,17 +8986,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
         
-        # If the previous session expired and was auto-reset, prepend a notice
-        # so the agent knows this is a fresh conversation (not an intentional /reset).
+        # If the previous session expired and was auto-reset, prepend the
+        # deterministic continuity handoff created before the session id was
+        # switched.  Do NOT tell the model this is context-free: that makes
+        # ambiguous follow-ups like "keep going" drift into static memory.
         if getattr(session_entry, 'was_auto_reset', False):
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
-            if reset_reason == "suspended":
-                context_note = "[System note: The user's previous session was stopped and suspended. This is a fresh conversation with no prior context.]"
-            elif reset_reason == "daily":
-                context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
-            else:
-                context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
-            context_prompt = context_note + "\n\n" + context_prompt
+            context_prompt = self._prepend_auto_reset_handoff(context_prompt, session_entry)
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -9011,8 +9026,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             reason_text = f"inactive for {duration}"
                         notice = (
                             f"◐ Session automatically reset ({reason_text}). "
-                            f"Conversation history cleared.\n"
-                            f"Use /resume to browse and restore a previous session.\n"
+                            f"A continuity handoff was preserved for the next turn.\n"
+                            f"Use /resume to browse and restore the full previous session.\n"
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
@@ -9030,6 +9045,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
+            session_entry.reset_handoff = None
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
