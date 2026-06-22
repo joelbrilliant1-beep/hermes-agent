@@ -347,6 +347,36 @@ class TestGatewaySurfacesNullResponse:
         assert response != "", "Null response with api_calls>0 must be surfaced"
         assert "nonexistent_tool" in response
 
+    def test_codex_app_server_startup_timeout_is_compact(self):
+        """Codex app-server startup stderr should stay out of chat."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 0,
+            "partial": True,
+            "interrupted": False,
+            "error": (
+                "codex app-server startup failed: codex app-server method "
+                "'thread/start' timed out after 15s\n"
+                "codex stderr (last 3 lines):\n"
+                "\x1b[33m WARN \x1b[0m codex_core_plugins::manifest: "
+                "ignoring interface.defaultPrompt[0]\n"
+                "WARN sqlx::query: slow statement db.statement=\"INSERT INTO logs\""
+            ),
+        }
+
+        response = agent_result.get("final_response") or ""
+        response = _normalize_empty_agent_response(
+            agent_result, response, history_len=10,
+        )
+
+        assert "Codex app-server startup timed out" in response
+        assert "/codex-runtime auto" in response
+        assert "codex stderr" not in response
+        assert "sqlx::query" not in response
+        assert "db.statement" not in response
+
     def test_interrupted_response_stays_empty(self):
         """Interrupted agent → response stays empty (platform handles UX)."""
         from gateway.run import _normalize_empty_agent_response
