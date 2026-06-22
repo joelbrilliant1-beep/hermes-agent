@@ -2378,15 +2378,18 @@ def _normalize_empty_agent_response(
                 "/reset to start fresh."
             )
         return (
-            f"The request failed: {str(error_detail)[:300]}\n"
+            f"The request failed: {_compact_agent_error_for_user(error_detail)}\n"
             "Try again or use /reset to start a fresh session."
         )
 
+    if agent_result.get("partial") and not agent_result.get("interrupted"):
+        err = agent_result.get("error", "processing incomplete")
+        if _is_codex_app_server_startup_timeout(err):
+            return f"⚠️ {_compact_agent_error_for_user(err)}"
+        return f"⚠️ Processing stopped: {_compact_agent_error_for_user(err)}. Try again."
+
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if api_calls > 0 and not agent_result.get("interrupted"):
-        if agent_result.get("partial"):
-            err = agent_result.get("error", "processing incomplete")
-            return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
         return (
             "⚠️ Processing completed but no response was generated. "
             "This may be a transient error — try sending your message again."
@@ -2409,6 +2412,37 @@ def _normalize_empty_agent_response(
         )
 
     return response
+
+
+def _compact_agent_error_for_user(error_detail: object) -> str:
+    """Return a short, platform-safe error summary for chat responses."""
+    text = str(error_detail or "unknown error").strip()
+    if not text:
+        return "unknown error"
+
+    if _is_codex_app_server_startup_timeout(text):
+        return (
+            "Codex app-server startup timed out while starting a thread. "
+            "Try again; if it repeats, switch back with /codex-runtime auto."
+        )
+
+    lower = text.lower()
+    marker = "\ncodex stderr"
+    marker_at = lower.find(marker)
+    if marker_at != -1:
+        text = text[:marker_at].strip()
+
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).strip()
+    return text[:300]
+
+
+def _is_codex_app_server_startup_timeout(error_detail: object) -> bool:
+    text = str(error_detail or "").lower()
+    return (
+        "codex app-server startup failed" in text
+        and "thread/start" in text
+        and "timed out" in text
+    )
 
 
 def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
@@ -16770,7 +16804,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                error_msg = _normalize_empty_agent_response(
+                    result,
+                    "",
+                    history_len=len(agent_history),
+                )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
