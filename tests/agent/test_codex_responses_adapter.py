@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_responses_adapter import (
+    _chat_messages_to_responses_input,
     _format_responses_error,
     _normalize_codex_response,
     _preflight_codex_api_kwargs,
@@ -67,6 +68,73 @@ def test_normalize_codex_response_treats_summary_only_reasoning_as_incomplete():
     assert assistant_message.content == ""
     assert assistant_message.reasoning == "still thinking"
     assert assistant_message.codex_reasoning_items is None
+
+
+def test_codex_backend_replays_assistant_messages_as_plain_text_not_message_items():
+    """ChatGPT Codex rejects replayed typed message items with
+    HTTP 400 {'detail': 'Unsupported content type'}.
+
+    Regression fixture is the 2026-06 Telegram reset loop: the previous
+    assistant reply was stored as codex_message_items with
+    type='message'/content=[output_text], then every next turn failed before
+    the model could answer. The Codex backend path must prefer the simple
+    assistant text item.
+    """
+    messages = [
+        {"role": "user", "content": "what happened?"},
+        {
+            "role": "assistant",
+            "content": "plain reply",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "id": "msg_bad_for_codex_backend",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "plain reply"}],
+                }
+            ],
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        current_issuer_kind="codex_backend",
+    )
+
+    assert not any(item.get("type") == "message" for item in items)
+    assert {"role": "assistant", "content": "plain reply"} in items
+
+
+def test_non_codex_responses_backends_still_replay_message_items():
+    messages = [
+        {"role": "user", "content": "what happened?"},
+        {
+            "role": "assistant",
+            "content": "plain reply",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "id": "msg_cacheable_elsewhere",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "plain reply"}],
+                }
+            ],
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        current_issuer_kind="xai_responses",
+    )
+
+    replayed = [item for item in items if item.get("type") == "message"]
+    assert len(replayed) == 1
+    assert replayed[0]["id"] == "msg_cacheable_elsewhere"
 
 
 # ---------------------------------------------------------------------------

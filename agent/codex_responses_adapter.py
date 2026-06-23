@@ -427,7 +427,18 @@ def _chat_messages_to_responses_input(
                 # previous turns so the API can maintain prefix-cache hits.
                 # OpenAI docs: "preserve and resend phase on all assistant
                 # messages — dropping it can degrade performance."
-                codex_message_items = msg.get("codex_message_items")
+                #
+                # The ChatGPT Codex backend rejects replayed typed message
+                # items (``type=message`` with ``output_text`` content) with
+                # HTTP 400 ``{'detail': 'Unsupported content type'}`` on the
+                # next turn. For that backend, fall back to the simple
+                # assistant text item below; keep the typed replay for other
+                # Responses surfaces that accept it.
+                codex_message_items = (
+                    None
+                    if current_issuer_kind == "codex_backend"
+                    else msg.get("codex_message_items")
+                )
                 replayed_message_items = 0
                 if isinstance(codex_message_items, list):
                     for raw_item in codex_message_items:
